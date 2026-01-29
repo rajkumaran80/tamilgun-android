@@ -1,0 +1,519 @@
+package com.example.tamilgun
+
+import android.os.Bundle
+import android.view.ViewGroup
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.setContent
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import coil.compose.AsyncImage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.jsoup.Jsoup
+
+data class Movie(val title: String, val thumbUrl: String, val detailUrl: String)
+data class PlayerSource(val name: String, val url: String)
+
+sealed class Screen {
+    object Setup : Screen() // New initial screen
+    data class Grid(val baseUrl: String) : Screen()
+    data class PlayerSelection(val movie: Movie, val baseUrl: String) : Screen()
+    data class VideoPlayer(val url: String, val movie: Movie) : Screen()
+}
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            var currentScreen by remember { mutableStateOf<Screen>(Screen.Setup) }
+            var lastPage by remember { mutableStateOf(1) }
+            var lastSelectedMovie by remember { mutableStateOf<Movie?>(null) }
+
+            // NEW: Hoist the baseUrl here so it persists across screen changes
+            var currentBaseUrl by remember { mutableStateOf("") }
+
+            // HOISTED STATE: Keep movies here so they don't disappear on back
+            var movies by remember { mutableStateOf(listOf<Movie>()) }
+
+            BackHandler(enabled = currentScreen !is Screen.Setup) {
+                currentScreen = when (val screen = currentScreen) {
+                    is Screen.VideoPlayer -> Screen.PlayerSelection(screen.movie, currentBaseUrl) // Use hoisted URL
+                    is Screen.PlayerSelection -> Screen.Grid(currentBaseUrl) // Use hoisted URL
+                    is Screen.Grid -> Screen.Setup
+                    else -> Screen.Setup
+                }
+            }
+
+            MaterialTheme(colorScheme = darkColorScheme()) {
+                Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF121212)) {
+                    when (val screen = currentScreen) {
+                        is Screen.Setup -> SetupScreen { selectedUrl ->
+                            movies = emptyList()
+                            lastPage = 1 // Reset page on new source
+                            currentBaseUrl = selectedUrl // Store the URL globally
+                            currentScreen = Screen.Grid(selectedUrl)
+                        }
+                        is Screen.Grid -> MovieGridScreen(
+                            baseUrl = currentBaseUrl, // Use hoisted URL
+                            initialPage = lastPage,
+                            initialSelectedMovie = lastSelectedMovie,
+                            movies = movies,
+                            onMoviesLoaded = { movies = it },
+                            onMovieClick = { movie, page ->
+                                lastSelectedMovie = movie
+                                lastPage = page // Save current page before leaving
+                                if (movie?.detailUrl?.isNotEmpty() == true) {
+                                    currentScreen = Screen.PlayerSelection(movie, currentBaseUrl)
+                                }
+                            }
+                        )
+                        is Screen.PlayerSelection -> PlayerSelectionScreen(screen.movie) { url ->
+                            currentScreen = Screen.VideoPlayer(url, screen.movie)
+                        }
+                        is Screen.VideoPlayer -> FullScreenPlayer(screen.url)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun SetupScreen(onUrlConfirmed: (String) -> Unit) {
+    val options = listOf(
+        "https://tamilgun.now/video-category/hd-movies/",
+        "https://tamilgun.group/video-category/hd-movies/"
+    )
+
+    var selectedOption by rememberSaveable { mutableStateOf(options[0]) }
+    var customFullUrl by rememberSaveable { mutableStateOf("https://tamilgun.now/video-category/hd-movies/") }
+    var isCustomSelected by rememberSaveable { mutableStateOf(false) }
+
+    val enterButtonFocus = remember { FocusRequester() }
+
+    // Auto-focus the ENTER button on load
+    LaunchedEffect(Unit) { enterButtonFocus.requestFocus() }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp)
+            .verticalScroll(rememberScrollState()),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text("TAMIL GUN", color = Color.Yellow, fontSize = 42.sp, fontWeight = FontWeight.Bold)
+        Text("Source Selection", color = Color.Gray, fontSize = 16.sp)
+
+        Spacer(modifier = Modifier.height(32.dp))
+
+        // 1. Preset Options Group
+        options.forEach { url ->
+            val isSelected = !isCustomSelected && selectedOption == url
+            TvSourceItem(
+                label = url,
+                isSelected = isSelected,
+                onClick = {
+                    selectedOption = url
+                    isCustomSelected = false
+                }
+            )
+        }
+
+        // 2. Custom URL Toggle (Separate from Text Box)
+        TvSourceItem(
+            label = "Use Custom URL (Edit below)",
+            isSelected = isCustomSelected,
+            onClick = { isCustomSelected = true }
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // 3. Separate Text Box Element
+        // Navigating 'Down' from the radio button above will land here
+        Column(
+            modifier = Modifier
+                .fillMaxWidth(0.8f)
+                .background(Color.White.copy(alpha = 0.05f), MaterialTheme.shapes.medium)
+                .padding(16.dp)
+        ) {
+            Text("Edit Custom URL:", color = Color.Gray, fontSize = 12.sp)
+            Spacer(modifier = Modifier.height(8.dp))
+
+            OutlinedTextField(
+                value = customFullUrl,
+                onValueChange = { customFullUrl = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 14.sp, color = Color.White),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = Color.Yellow,
+                    unfocusedBorderColor = Color.DarkGray
+                )
+            )
+        }
+
+        Spacer(modifier = Modifier.height(40.dp))
+
+        // 4. Enter Button
+        TvButton(
+            label = "ENTER",
+            modifier = Modifier
+                .width(260.dp)
+                .focusRequester(enterButtonFocus)
+        ) {
+            val finalUrl = if (isCustomSelected) customFullUrl else selectedOption
+            val formattedUrl = if (finalUrl.endsWith("/")) finalUrl else "$finalUrl/"
+            onUrlConfirmed(formattedUrl)
+        }
+    }
+}
+
+@Composable
+fun TvSourceItem(label: String, isSelected: Boolean, onClick: () -> Unit) {
+    var isFocused by remember { mutableStateOf(false) }
+
+    Row(
+        Modifier
+            .fillMaxWidth(0.8f)
+            .padding(vertical = 4.dp)
+            .border(
+                width = 2.dp,
+                color = if (isFocused) Color.Yellow else Color.Transparent,
+                shape = MaterialTheme.shapes.small
+            )
+            .onFocusChanged { isFocused = it.isFocused }
+            .clickable { onClick() }
+            .padding(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        RadioButton(
+            selected = isSelected,
+            onClick = null, // Handled by Row click
+            colors = RadioButtonDefaults.colors(selectedColor = Color.Yellow)
+        )
+        Text(
+            text = label,
+            color = if (isFocused) Color.Yellow else Color.White,
+            modifier = Modifier.padding(start = 12.dp)
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MovieGridScreen(
+    baseUrl: String,
+    initialPage: Int,
+    initialSelectedMovie: Movie?,
+    movies: List<Movie>,
+    onMoviesLoaded: (List<Movie>) -> Unit,
+    onMovieClick: (Movie?, Int) -> Unit
+) {
+    var currentPage by remember { mutableStateOf(initialPage) }
+    var isLoading by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val gridState = rememberLazyGridState()
+
+    // Key Change: This effect triggers whenever currentPage or baseUrl changes
+    LaunchedEffect(currentPage, baseUrl) {
+        isLoading = true
+        // Optional: Clear list immediately so user sees the loader while fetching
+        // onMoviesLoaded(emptyList())
+
+        scope.launch(Dispatchers.IO) {
+            try {
+                val cleanBase = baseUrl.removeSuffix("/")
+                // Ensure the URL is constructed correctly for pagination
+                val url = if (currentPage == 1) "$cleanBase/" else "$cleanBase/page/$currentPage/"
+
+                val doc = Jsoup.connect(url).get()
+                val elements = doc.select("article.post-item")
+                val scraped = elements.map {
+                    Movie(
+                        it.select("h3.entry-title a").text(),
+                        it.select("img.blog-img").attr("src"),
+                        it.select("h3.entry-title a").attr("href")
+                    )
+                }
+                withContext(Dispatchers.Main) {
+                    onMoviesLoaded(scraped)
+                    isLoading = false
+                    // Scroll back to top on page change
+                    gridState.scrollToItem(0)
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { isLoading = false }
+            }
+        }
+    }
+
+    Scaffold(
+        topBar = { CenterAlignedTopAppBar(title = { Text("TAMIL GUN", color = Color.Yellow, fontWeight = FontWeight.Bold) }, colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = Color.Black)) },
+        containerColor = Color(0xFF121212)
+    ) { innerPadding ->
+        if (isLoading && movies.isEmpty()) { // Show loading only if list is empty
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Color.Yellow) }
+        } else {
+            LazyVerticalGrid(
+                state = gridState,
+                columns = GridCells.Fixed(4),
+                contentPadding = PaddingValues(start = 24.dp, end = 24.dp, top = innerPadding.calculateTopPadding() + 16.dp, bottom = 16.dp),
+                modifier = Modifier.fillMaxSize()
+            ) {
+                itemsIndexed(movies) { index, movie ->
+                    val focusRequester = remember { FocusRequester() }
+                    LaunchedEffect(movies) {
+                        if (initialSelectedMovie != null && movie.detailUrl == initialSelectedMovie.detailUrl) focusRequester.requestFocus()
+                        else if (initialSelectedMovie == null && index == 0) focusRequester.requestFocus()
+                    }
+                    MovieTile(movie = movie, modifier = Modifier.focusRequester(focusRequester), onClick = { onMovieClick(movie, currentPage) })
+                }
+                item(span = { GridItemSpan(4) }) {
+                    Row(modifier = Modifier.fillMaxWidth().padding(top = 32.dp, bottom = 48.dp), horizontalArrangement = Arrangement.Center) {
+                        TvButton(label = "« Prev", enabled = currentPage > 1, modifier = Modifier.width(140.dp)) { currentPage-- }
+                        Text("Page $currentPage", color = Color.White, modifier = Modifier.padding(horizontal = 24.dp))
+                        TvButton(label = "Next »", modifier = Modifier.width(140.dp)) { currentPage++ }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun MovieTile(movie: Movie, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    var isFocused by remember { mutableStateOf(false) }
+    val scale by animateFloatAsState(if (isFocused) 1.1f else 1.0f, label = "scale")
+    val borderColor by animateColorAsState(if (isFocused) Color.Yellow else Color.Transparent, label = "border")
+    Column(
+        modifier = modifier
+            .padding(8.dp)
+            .scale(scale)
+            .onFocusChanged { isFocused = it.isFocused }
+            .focusable()
+            .clickable { onClick() },
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(modifier = Modifier
+            .aspectRatio(16f / 9f)
+            .clip(MaterialTheme.shapes.medium)
+            .border(2.dp, borderColor, MaterialTheme.shapes.medium)
+        ) {
+            AsyncImage(
+                model = movie.thumbUrl,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+        Text(
+            text = movie.title,
+            color = if (isFocused) Color.Yellow else Color.White,
+            maxLines = 1,
+            modifier = Modifier.padding(top = 4.dp),
+            fontWeight = if (isFocused) FontWeight.Bold else FontWeight.Normal
+        )
+    }
+}
+
+@Composable
+fun TvButton(label: String, modifier: Modifier = Modifier, enabled: Boolean = true, onClick: () -> Unit) {
+    var isFocused by remember { mutableStateOf(false) }
+    val scale by animateFloatAsState(if (isFocused && enabled) 1.05f else 1.0f, label = "btnScale")
+    Button(
+        onClick = onClick,
+        enabled = enabled,
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (isFocused) Color.Yellow else Color.DarkGray,
+            contentColor = if (isFocused) Color.Black else Color.White,
+            disabledContainerColor = Color(0xFF222222)
+        ),
+        modifier = modifier
+            .onFocusChanged { isFocused = it.isFocused }
+            .scale(scale)
+            .focusable()
+    ) {
+        Text(label, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+fun PlayerSelectionScreen(movie: Movie, onSourceSelected: (String) -> Unit) {
+    var sources by remember { mutableStateOf(listOf<PlayerSource>()) }
+    var isLoading by remember { mutableStateOf(true) }
+    LaunchedEffect(movie) {
+        withContext(Dispatchers.IO) {
+            try {
+                val doc = Jsoup.connect(movie.detailUrl).get()
+                val videoContainers = doc.select(".video-container iframe")
+                val scraped = videoContainers.mapIndexed { i, el ->
+                    PlayerSource("Player ${i + 1}", el.attr("src"))
+                }
+                withContext(Dispatchers.Main) {
+                    sources = scraped
+                    isLoading = false
+                }
+            } catch (e: Exception) { isLoading = false }
+        }
+    }
+    Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(movie.title, style = MaterialTheme.typography.headlineSmall, color = Color.White, modifier = Modifier.padding(bottom = 32.dp))
+        if (isLoading) CircularProgressIndicator(color = Color.Yellow)
+        else {
+            sources.forEachIndexed { index, source ->
+                val focusRequester = remember { FocusRequester() }
+                LaunchedEffect(Unit) { if (index == 0) focusRequester.requestFocus() }
+                TvButton(
+                    label = source.name,
+                    modifier = Modifier.width(220.dp).padding(8.dp).focusRequester(focusRequester)
+                ) { onSourceSelected(source.url) }
+            }
+        }
+    }
+}
+
+@Composable
+fun FullScreenPlayer(videoUrl: String) {
+    val finalUrl = if (videoUrl.startsWith("//")) "https:$videoUrl" else videoUrl
+
+    AndroidView(
+        modifier = Modifier.fillMaxSize().background(Color.Black).focusable(),
+        factory = { context ->
+            WebView(context).apply {
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.mediaPlaybackRequiresUserGesture = false
+                settings.allowContentAccess = true
+                settings.userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+
+                isFocusable = true
+                isFocusableInTouchMode = true
+
+                webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+
+                        val script = """
+                            (function() {
+                                var style = document.createElement('style');
+                                style.innerHTML = `
+                                    .scroll-top, #scroll-top, .back-to-top, [class*="scroll"], [id*="scroll"] {
+                                        opacity: 0 !important;
+                                        pointer-events: none !important;
+                                        width: 1px !important;
+                                        height: 1px !important;
+                                        z-index: -9999 !important;
+                                    }
+                                    #over_player, .ads-class, .pop-under, [id^="ad_"] { display: none !important; }
+                                `;
+                                document.head.appendChild(style);
+
+                                Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
+                                Object.defineProperty(document, 'hidden', {get: function() { return false; }});
+
+                                function teleportFocus() {
+                                    var active = document.activeElement;
+                                    var badSelectors = '.scroll-top, #scroll-top, .back-to-top, [class*="scroll"]';
+                                    if (active && active.matches(badSelectors)) {
+                                        active.blur();
+                                        var pBtn = document.querySelector('.vjs-big-play-button, .jw-display-icon-container, #play-btn, video');
+                                        if (pBtn) pBtn.focus();
+                                    }
+                                }
+                                document.addEventListener('focusin', teleportFocus);
+
+                                var userClicked = false;
+                                document.addEventListener('click', () => {
+                                    userClicked = true;
+                                    setTimeout(() => { userClicked = false; }, 3000);
+                                });
+
+                                var loadCounter = 0;
+                                var itv = setInterval(() => {
+                                    loadCounter++;
+                                    var v = document.querySelector('video');
+                                    if (v && v.paused && !userClicked && loadCounter < 15) {
+                                        v.muted = false;
+                                        v.play().catch(()=>{});
+                                    }
+
+                                    if (loadCounter < 8) {
+                                       var btn = document.querySelector('.vjs-big-play-button, .jw-display-icon-container, #play-btn');
+                                       if (btn) btn.click();
+                                    }
+                                    teleportFocus();
+                                }, 1500);
+
+                                setTimeout(() => clearInterval(itv), 25000);
+                            })();
+                        """.trimIndent()
+                        evaluateJavascript(script, null)
+
+                        postDelayed({
+                            val x = width / 2f
+                            val y = height / 2f
+                            val t = android.os.SystemClock.uptimeMillis()
+                            dispatchTouchEvent(android.view.MotionEvent.obtain(t, t, android.view.MotionEvent.ACTION_DOWN, x, y, 0))
+                            dispatchTouchEvent(android.view.MotionEvent.obtain(android.os.SystemClock.uptimeMillis(), android.os.SystemClock.uptimeMillis(), android.view.MotionEvent.ACTION_UP, x, y, 0))
+                        }, 4000)
+                    }
+                }
+
+                webChromeClient = WebChromeClient()
+
+                setOnKeyListener { v, keyCode, event ->
+                    if (event.action == android.view.KeyEvent.ACTION_DOWN) {
+                        if (keyCode == android.view.KeyEvent.KEYCODE_DPAD_CENTER || keyCode == android.view.KeyEvent.KEYCODE_ENTER) {
+                            val x = v.width / 2f
+                            val y = v.height / 2f
+                            val time = android.os.SystemClock.uptimeMillis()
+                            dispatchTouchEvent(android.view.MotionEvent.obtain(time, time, android.view.KeyEvent.ACTION_DOWN, x, y, 0))
+                            dispatchTouchEvent(android.view.MotionEvent.obtain(android.os.SystemClock.uptimeMillis(), android.os.SystemClock.uptimeMillis(), android.view.KeyEvent.ACTION_UP, x, y, 0))
+                            return@setOnKeyListener true
+                        }
+                    }
+                    false
+                }
+                loadUrl(finalUrl, mapOf("Referer" to "https://tamilgun.now/"))
+            }
+        }
+    )
+}
