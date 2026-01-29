@@ -1,0 +1,317 @@
+package com.example.tamilgun
+
+import android.os.Bundle
+import android.view.ViewGroup
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.setContent
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import coil.compose.AsyncImage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.jsoup.Jsoup
+
+// --- Models ---
+data class Movie(val title: String, val thumbUrl: String, val detailUrl: String)
+data class PlayerSource(val name: String, val url: String)
+
+sealed class Screen {
+    object Grid : Screen()
+    data class PlayerSelection(val movie: Movie) : Screen()
+    data class VideoPlayer(val url: String, val movie: Movie) : Screen()
+}
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            var currentScreen by remember { mutableStateOf<Screen>(Screen.Grid) }
+            var lastPage by remember { mutableStateOf(1) }
+            var lastSelectedMovie by remember { mutableStateOf<Movie?>(null) }
+
+            BackHandler(enabled = currentScreen !is Screen.Grid) {
+                currentScreen = when (val screen = currentScreen) {
+                    is Screen.VideoPlayer -> Screen.PlayerSelection(screen.movie)
+                    is Screen.PlayerSelection -> Screen.Grid
+                    else -> Screen.Grid
+                }
+            }
+
+            MaterialTheme {
+                Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF121212)) {
+                    when (val screen = currentScreen) {
+                        is Screen.Grid -> MovieGridScreen(
+                            initialPage = lastPage,
+                            initialSelectedMovie = lastSelectedMovie,
+                            onMovieClick = { movie, page ->
+                                lastSelectedMovie = movie
+                                lastPage = page
+                                if (movie?.detailUrl?.isNotEmpty() == true) {
+                                    currentScreen = Screen.PlayerSelection(movie)
+                                }
+                            }
+                        )
+                        is Screen.PlayerSelection -> PlayerSelectionScreen(screen.movie) { url ->
+                            currentScreen = Screen.VideoPlayer(url, screen.movie)
+                        }
+                        is Screen.VideoPlayer -> FullScreenPlayer(screen.url)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MovieGridScreen(
+    initialPage: Int,
+    initialSelectedMovie: Movie?,
+    onMovieClick: (Movie?, Int) -> Unit
+) {
+    var movies by remember { mutableStateOf(listOf<Movie>()) }
+    var currentPage by remember { mutableStateOf(initialPage) }
+    var isLoading by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+
+    val scope = rememberCoroutineScope()
+    val gridState = rememberLazyGridState()
+
+    // Scraper Logic
+    fun loadMovies() {
+        isLoading = true
+        errorMessage = null
+        scope.launch(Dispatchers.IO) {
+            try {
+                val url = if (currentPage == 1) "https://tamilgun.now/video-category/hd-movies/"
+                else "https://tamilgun.now/video-category/hd-movies/page/$currentPage/"
+
+                // Enhanced Jsoup connection to bypass bot detection
+                val doc = Jsoup.connect(url)
+                    .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+                    .header("Accept-Language", "en-US,en;q=0.9")
+                    .timeout(20000)
+                    .get()
+
+                val elements = doc.select("article.post-item")
+                val scraped = elements.map {
+                    Movie(
+                        it.select("h3.entry-title a").text(),
+                        it.select("img.blog-img").attr("src"),
+                        it.select("h3.entry-title a").attr("href")
+                    )
+                }
+
+                withContext(Dispatchers.Main) {
+                    if (scraped.isEmpty()) {
+                        errorMessage = "No movies found. The site layout might have changed."
+                    } else {
+                        movies = scraped
+                    }
+                    isLoading = false
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    errorMessage = "Connection Error: ${e.localizedMessage}"
+                    isLoading = false
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(currentPage) {
+        if (currentPage != initialPage) onMovieClick(null, currentPage)
+        loadMovies()
+    }
+
+    Scaffold(
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = { Text("TAMIL GUN", color = Color.Yellow, fontWeight = FontWeight.Bold, letterSpacing = 4.sp) },
+                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = Color.Black)
+            )
+        },
+        containerColor = Color(0xFF121212)
+    ) { innerPadding ->
+        Box(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
+            if (isLoading) {
+                CircularProgressIndicator(modifier = Modifier.align(Alignment.Center), color = Color.Yellow)
+            } else if (errorMessage != null) {
+                Column(modifier = Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(errorMessage!!, color = Color.LightGray, modifier = Modifier.padding(16.dp))
+                    TvButton(label = "Retry") { loadMovies() }
+                }
+            } else {
+                LazyVerticalGrid(
+                    state = gridState,
+                    columns = GridCells.Fixed(4),
+                    contentPadding = PaddingValues(24.dp)
+                ) {
+                    itemsIndexed(movies) { index, movie ->
+                        val focusRequester = remember { FocusRequester() }
+                        LaunchedEffect(movies) {
+                            if (initialSelectedMovie != null && movie.detailUrl == initialSelectedMovie.detailUrl) {
+                                focusRequester.requestFocus()
+                            } else if (initialSelectedMovie == null && index == 0) {
+                                focusRequester.requestFocus()
+                            }
+                        }
+                        MovieTile(
+                            movie = movie,
+                            modifier = Modifier.focusRequester(focusRequester),
+                            onClick = { onMovieClick(movie, currentPage) }
+                        )
+                    }
+
+                    item(span = { GridItemSpan(4) }) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(top = 32.dp, bottom = 48.dp),
+                            horizontalArrangement = Arrangement.Center,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TvButton(label = "« Prev", enabled = currentPage > 1, modifier = Modifier.width(140.dp)) { currentPage-- }
+                            Text("Page $currentPage", color = Color.White, modifier = Modifier.padding(horizontal = 24.dp))
+                            TvButton(label = "Next »", modifier = Modifier.width(140.dp)) { currentPage++ }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// --- Shared Components (MovieTile, TvButton) remain largely the same for UI consistency ---
+
+@Composable
+fun MovieTile(movie: Movie, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    var isFocused by remember { mutableStateOf(false) }
+    val scale by animateFloatAsState(if (isFocused) 1.08f else 1.0f)
+    val borderColor by animateColorAsState(if (isFocused) Color.Yellow else Color.Transparent)
+
+    Column(
+        modifier = modifier
+            .padding(8.dp)
+            .scale(scale)
+            .onFocusChanged { isFocused = it.isFocused }
+            .focusable()
+            .clickable { onClick() },
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(modifier = Modifier
+            .aspectRatio(16f / 9f)
+            .clip(MaterialTheme.shapes.medium)
+            .border(2.dp, borderColor, MaterialTheme.shapes.medium)
+        ) {
+            AsyncImage(model = movie.thumbUrl, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+        }
+        Text(movie.title, color = if (isFocused) Color.Yellow else Color.White, maxLines = 1, modifier = Modifier.padding(top = 4.dp))
+    }
+}
+
+@Composable
+fun TvButton(label: String, modifier: Modifier = Modifier, enabled: Boolean = true, onClick: () -> Unit) {
+    var isFocused by remember { mutableStateOf(false) }
+    Button(
+        onClick = onClick,
+        enabled = enabled,
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (isFocused) Color.Yellow else Color.DarkGray,
+            contentColor = if (isFocused) Color.Black else Color.White
+        ),
+        modifier = modifier.onFocusChanged { isFocused = it.isFocused }.focusable()
+    ) {
+        Text(label, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+fun PlayerSelectionScreen(movie: Movie, onSourceSelected: (String) -> Unit) {
+    var sources by remember { mutableStateOf(listOf<PlayerSource>()) }
+    var isLoading by remember { mutableStateOf(true) }
+
+    LaunchedEffect(movie) {
+        withContext(Dispatchers.IO) {
+            try {
+                val doc = Jsoup.connect(movie.detailUrl)
+                    .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+                    .get()
+                val videoContainers = doc.select(".video-container iframe")
+                val scraped = videoContainers.mapIndexed { i, el -> PlayerSource("Player ${i + 1}", el.attr("src")) }
+                withContext(Dispatchers.Main) {
+                    sources = scraped
+                    isLoading = false
+                }
+            } catch (e: Exception) { isLoading = false }
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(movie.title, color = Color.White, modifier = Modifier.padding(bottom = 24.dp), fontSize = 20.sp)
+        if (isLoading) CircularProgressIndicator(color = Color.Yellow)
+        else {
+            sources.forEach { source ->
+                TvButton(label = source.name, modifier = Modifier.width(200.dp).padding(8.dp)) {
+                    onSourceSelected(source.url)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun FullScreenPlayer(videoUrl: String) {
+    val finalUrl = if (videoUrl.startsWith("//")) "https:$videoUrl" else videoUrl
+    AndroidView(
+        modifier = Modifier.fillMaxSize().background(Color.Black),
+        factory = { context ->
+            WebView(context).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.mediaPlaybackRequiresUserGesture = false
+                webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        // JavaScript auto-play and anti-pause scripts
+                        evaluateJavascript("""
+                            (function() {
+                                Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
+                                var v = document.querySelector('video');
+                                if (v) { v.play(); }
+                            })();
+                        """.trimIndent(), null)
+                    }
+                }
+                loadUrl(finalUrl, mapOf("Referer" to "https://tamilgun.now/"))
+            }
+        }
+    )
+}
