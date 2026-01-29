@@ -20,8 +20,11 @@ import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -45,8 +48,9 @@ data class Movie(val title: String, val thumbUrl: String, val detailUrl: String)
 data class PlayerSource(val name: String, val url: String)
 
 sealed class Screen {
-    object Grid : Screen()
-    data class PlayerSelection(val movie: Movie) : Screen()
+    object Setup : Screen() // New initial screen
+    data class Grid(val baseUrl: String) : Screen()
+    data class PlayerSelection(val movie: Movie, val baseUrl: String) : Screen()
     data class VideoPlayer(val url: String, val movie: Movie) : Screen()
 }
 
@@ -54,29 +58,45 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            var currentScreen by remember { mutableStateOf<Screen>(Screen.Grid) }
+            var currentScreen by remember { mutableStateOf<Screen>(Screen.Setup) }
             var lastPage by remember { mutableStateOf(1) }
             var lastSelectedMovie by remember { mutableStateOf<Movie?>(null) }
 
-            BackHandler(enabled = currentScreen !is Screen.Grid) {
+            // NEW: Hoist the baseUrl here so it persists across screen changes
+            var currentBaseUrl by remember { mutableStateOf("") }
+
+            // HOISTED STATE: Keep movies here so they don't disappear on back
+            var movies by remember { mutableStateOf(listOf<Movie>()) }
+
+            BackHandler(enabled = currentScreen !is Screen.Setup) {
                 currentScreen = when (val screen = currentScreen) {
-                    is Screen.VideoPlayer -> Screen.PlayerSelection(screen.movie)
-                    is Screen.PlayerSelection -> Screen.Grid
-                    else -> Screen.Grid
+                    is Screen.VideoPlayer -> Screen.PlayerSelection(screen.movie, currentBaseUrl) // Use hoisted URL
+                    is Screen.PlayerSelection -> Screen.Grid(currentBaseUrl) // Use hoisted URL
+                    is Screen.Grid -> Screen.Setup
+                    else -> Screen.Setup
                 }
             }
 
-            MaterialTheme {
+            MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF121212)) {
                     when (val screen = currentScreen) {
+                        is Screen.Setup -> SetupScreen { selectedUrl ->
+                            movies = emptyList()
+                            lastPage = 1 // Reset page on new source
+                            currentBaseUrl = selectedUrl // Store the URL globally
+                            currentScreen = Screen.Grid(selectedUrl)
+                        }
                         is Screen.Grid -> MovieGridScreen(
+                            baseUrl = currentBaseUrl, // Use hoisted URL
                             initialPage = lastPage,
                             initialSelectedMovie = lastSelectedMovie,
+                            movies = movies,
+                            onMoviesLoaded = { movies = it },
                             onMovieClick = { movie, page ->
                                 lastSelectedMovie = movie
-                                lastPage = page
+                                lastPage = page // Save current page before leaving
                                 if (movie?.detailUrl?.isNotEmpty() == true) {
-                                    currentScreen = Screen.PlayerSelection(movie)
+                                    currentScreen = Screen.PlayerSelection(movie, currentBaseUrl)
                                 }
                             }
                         )
@@ -91,28 +111,155 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@Composable
+fun SetupScreen(onUrlConfirmed: (String) -> Unit) {
+    val options = listOf(
+        "https://tamilgun.now/video-category/hd-movies/",
+        "https://tamilgun.group/video-category/hd-movies/"
+    )
+
+    var selectedOption by rememberSaveable { mutableStateOf(options[0]) }
+    var customFullUrl by rememberSaveable { mutableStateOf("https://tamilgun.now/video-category/hd-movies/") }
+    var isCustomSelected by rememberSaveable { mutableStateOf(false) }
+
+    val enterButtonFocus = remember { FocusRequester() }
+
+    // Auto-focus the ENTER button on load
+    LaunchedEffect(Unit) { enterButtonFocus.requestFocus() }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp)
+            .verticalScroll(rememberScrollState()),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text("TAMIL GUN", color = Color.Yellow, fontSize = 42.sp, fontWeight = FontWeight.Bold)
+        Text("Source Selection", color = Color.Gray, fontSize = 16.sp)
+
+        Spacer(modifier = Modifier.height(32.dp))
+
+        // 1. Preset Options Group
+        options.forEach { url ->
+            val isSelected = !isCustomSelected && selectedOption == url
+            TvSourceItem(
+                label = url,
+                isSelected = isSelected,
+                onClick = {
+                    selectedOption = url
+                    isCustomSelected = false
+                }
+            )
+        }
+
+        // 2. Custom URL Toggle (Separate from Text Box)
+        TvSourceItem(
+            label = "Use Custom URL (Edit below)",
+            isSelected = isCustomSelected,
+            onClick = { isCustomSelected = true }
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // 3. Separate Text Box Element
+        // Navigating 'Down' from the radio button above will land here
+        Column(
+            modifier = Modifier
+                .fillMaxWidth(0.8f)
+                .background(Color.White.copy(alpha = 0.05f), MaterialTheme.shapes.medium)
+                .padding(16.dp)
+        ) {
+            Text("Edit Custom URL:", color = Color.Gray, fontSize = 12.sp)
+            Spacer(modifier = Modifier.height(8.dp))
+
+            OutlinedTextField(
+                value = customFullUrl,
+                onValueChange = { customFullUrl = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 14.sp, color = Color.White),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = Color.Yellow,
+                    unfocusedBorderColor = Color.DarkGray
+                )
+            )
+        }
+
+        Spacer(modifier = Modifier.height(40.dp))
+
+        // 4. Enter Button
+        TvButton(
+            label = "ENTER",
+            modifier = Modifier
+                .width(260.dp)
+                .focusRequester(enterButtonFocus)
+        ) {
+            val finalUrl = if (isCustomSelected) customFullUrl else selectedOption
+            val formattedUrl = if (finalUrl.endsWith("/")) finalUrl else "$finalUrl/"
+            onUrlConfirmed(formattedUrl)
+        }
+    }
+}
+
+@Composable
+fun TvSourceItem(label: String, isSelected: Boolean, onClick: () -> Unit) {
+    var isFocused by remember { mutableStateOf(false) }
+
+    Row(
+        Modifier
+            .fillMaxWidth(0.8f)
+            .padding(vertical = 4.dp)
+            .border(
+                width = 2.dp,
+                color = if (isFocused) Color.Yellow else Color.Transparent,
+                shape = MaterialTheme.shapes.small
+            )
+            .onFocusChanged { isFocused = it.isFocused }
+            .clickable { onClick() }
+            .padding(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        RadioButton(
+            selected = isSelected,
+            onClick = null, // Handled by Row click
+            colors = RadioButtonDefaults.colors(selectedColor = Color.Yellow)
+        )
+        Text(
+            text = label,
+            color = if (isFocused) Color.Yellow else Color.White,
+            modifier = Modifier.padding(start = 12.dp)
+        )
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MovieGridScreen(
+    baseUrl: String,
     initialPage: Int,
     initialSelectedMovie: Movie?,
+    movies: List<Movie>,
+    onMoviesLoaded: (List<Movie>) -> Unit,
     onMovieClick: (Movie?, Int) -> Unit
 ) {
-    var movies by remember { mutableStateOf(listOf<Movie>()) }
     var currentPage by remember { mutableStateOf(initialPage) }
     var isLoading by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val gridState = rememberLazyGridState()
 
-    LaunchedEffect(currentPage) {
-        if (currentPage != initialPage) {
-            onMovieClick(null, currentPage)
-        }
+    // Key Change: This effect triggers whenever currentPage or baseUrl changes
+    LaunchedEffect(currentPage, baseUrl) {
         isLoading = true
+        // Optional: Clear list immediately so user sees the loader while fetching
+        // onMoviesLoaded(emptyList())
+
         scope.launch(Dispatchers.IO) {
             try {
-                val url = if (currentPage == 1) "https://tamilgun.now/video-category/hd-movies/"
-                else "https://tamilgun.now/video-category/hd-movies/page/$currentPage/"
+                val cleanBase = baseUrl.removeSuffix("/")
+                // Ensure the URL is constructed correctly for pagination
+                val url = if (currentPage == 1) "$cleanBase/" else "$cleanBase/page/$currentPage/"
+
                 val doc = Jsoup.connect(url).get()
                 val elements = doc.select("article.post-item")
                 val scraped = elements.map {
@@ -123,71 +270,40 @@ fun MovieGridScreen(
                     )
                 }
                 withContext(Dispatchers.Main) {
-                    movies = scraped
+                    onMoviesLoaded(scraped)
                     isLoading = false
+                    // Scroll back to top on page change
+                    gridState.scrollToItem(0)
                 }
             } catch (e: Exception) {
-                isLoading = false
+                withContext(Dispatchers.Main) { isLoading = false }
             }
         }
     }
 
     Scaffold(
-        topBar = {
-            CenterAlignedTopAppBar(
-                title = {
-                    Text(
-                        "TAMIL GUN",
-                        color = Color.Yellow,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 4.sp
-                    )
-                },
-                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = Color.Black)
-            )
-        },
+        topBar = { CenterAlignedTopAppBar(title = { Text("TAMIL GUN", color = Color.Yellow, fontWeight = FontWeight.Bold) }, colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = Color.Black)) },
         containerColor = Color(0xFF121212)
     ) { innerPadding ->
-        if (isLoading) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(color = Color.Yellow)
-            }
+        if (isLoading && movies.isEmpty()) { // Show loading only if list is empty
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Color.Yellow) }
         } else {
             LazyVerticalGrid(
                 state = gridState,
                 columns = GridCells.Fixed(4),
-                contentPadding = PaddingValues(
-                    start = 24.dp,
-                    end = 24.dp,
-                    top = innerPadding.calculateTopPadding() + 16.dp,
-                    bottom = 16.dp
-                ),
+                contentPadding = PaddingValues(start = 24.dp, end = 24.dp, top = innerPadding.calculateTopPadding() + 16.dp, bottom = 16.dp),
                 modifier = Modifier.fillMaxSize()
             ) {
-                // Movie Items
                 itemsIndexed(movies) { index, movie ->
                     val focusRequester = remember { FocusRequester() }
                     LaunchedEffect(movies) {
-                        if (initialSelectedMovie != null && movie.detailUrl == initialSelectedMovie.detailUrl) {
-                            focusRequester.requestFocus()
-                        } else if (initialSelectedMovie == null && index == 0) {
-                            focusRequester.requestFocus()
-                        }
+                        if (initialSelectedMovie != null && movie.detailUrl == initialSelectedMovie.detailUrl) focusRequester.requestFocus()
+                        else if (initialSelectedMovie == null && index == 0) focusRequester.requestFocus()
                     }
-                    MovieTile(
-                        movie = movie,
-                        modifier = Modifier.focusRequester(focusRequester),
-                        onClick = { onMovieClick(movie, currentPage) }
-                    )
+                    MovieTile(movie = movie, modifier = Modifier.focusRequester(focusRequester), onClick = { onMovieClick(movie, currentPage) })
                 }
-
-                // Navigation Buttons (Moved to the bottom of the scrollable list)
                 item(span = { GridItemSpan(4) }) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(top = 32.dp, bottom = 48.dp),
-                        horizontalArrangement = Arrangement.Center,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
+                    Row(modifier = Modifier.fillMaxWidth().padding(top = 32.dp, bottom = 48.dp), horizontalArrangement = Arrangement.Center) {
                         TvButton(label = "« Prev", enabled = currentPage > 1, modifier = Modifier.width(140.dp)) { currentPage-- }
                         Text("Page $currentPage", color = Color.White, modifier = Modifier.padding(horizontal = 24.dp))
                         TvButton(label = "Next »", modifier = Modifier.width(140.dp)) { currentPage++ }
